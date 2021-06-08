@@ -1,0 +1,1793 @@
+Description: ''
+Parameters:
+  DomainName:
+    Type: String
+    Default: studio-emr
+    Description: "SageMaker Studio Domain Name. Default is studio-emr."
+  UserProfileName:
+    Type: String
+    Description: "User Profile Name "
+    Default: "user"
+Mappings:
+  Studio:
+    s3params:
+      S3Bucket: ee-assets-prod-us-east-1
+      S3Key: modules/be401d2597bc44b09a85e71c6dbabb1b/v1/
+  ClusterConfigurations:
+    emr:
+      masterInstanceType: m5.2xlarge
+      coreInstanceType: m5.xlarge
+      masterInstanceCount: 1
+      coreInstanceCount: 2
+      emrReleaseVersion: emr-5.30.1
+      BootStrapScriptFile: createlinuxusers.sh
+      StepScriptFile: configurekdc.sh
+      MLeapJar: mleap_spark_assembly.jar
+    sagemaker:
+      sageMakerConfigName: SageEMRConfig
+      sageMakerInstanceName: SageEMR
+      sageMakerInstanceType: ml.t3.medium
+  VpcConfigurations:
+    cidr:
+      Vpc: 10.0.0.0/16
+      PublicSubnet1: 10.0.10.0/24
+      PrivateSubnet1: 10.0.20.0/24
+  RegionMap:
+    us-east-1:
+      datascience: "arn:aws:sagemaker:us-east-1:081325390199:image/datascience-1.0"
+      tensorflow23cpu: "arn:aws:sagemaker:us-east-1:081325390199:image/tensorflow-2.3-cpu-py37-ubuntu18.04-v1"
+      pysparkmagic: "arn:aws:sagemaker:us-east-1:081325390199:image/sparkmagic-1.0"
+
+Resources:
+  VPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: !FindInMap 
+        - VpcConfigurations
+        - cidr
+        - Vpc
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-VPC'
+  InternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-IGW'
+  InternetGatewayAttachment:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+  PublicSubnet1:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select 
+        - 0
+        - !GetAZs ''
+      CidrBlock: !FindInMap 
+        - VpcConfigurations
+        - cidr
+        - PublicSubnet1
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName} Public Subnet (AZ1)'
+  PrivateSubnet1:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select 
+        - 0
+        - !GetAZs ''
+      CidrBlock: !FindInMap 
+        - VpcConfigurations
+        - cidr
+        - PrivateSubnet1
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName} Private Subnet (AZ1)'
+  NatGateway1EIP:
+    Type: 'AWS::EC2::EIP'
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+  NatGateway1:
+    Type: 'AWS::EC2::NatGateway'
+    Properties:
+      AllocationId: !GetAtt 
+        - NatGateway1EIP
+        - AllocationId
+      SubnetId: !Ref PublicSubnet1
+  PublicRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName} Public Routes'
+  DefaultPublicRoute:
+    Type: 'AWS::EC2::Route'
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnet1RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+  PrivateRouteTable1:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName} Private Routes (AZ1)'
+  PrivateSubnet1RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+  PrivateSubnet1InternetRoute:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+  NoIngressSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: no-ingress-sg
+      GroupDescription: Security group with no ingress rule
+      VpcId: !Ref VPC
+  EC2SecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Enable access to the EC2 host
+      VpcId: !Ref VPC
+  S3Endpoint:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - '*'
+            Resource:
+              - '*'
+      VpcId: !Ref VPC
+      RouteTableIds:
+        - !Ref PrivateRouteTable1
+  S3Bucket:
+    Type: 'AWS::S3::Bucket'
+  masterSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: EMR Master SG
+      VpcId: !Ref VPC
+  slaveSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: EMR Slave SG
+      VpcId: !Ref VPC
+  emrServiceSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: EMR Service Access SG
+      VpcId: !Ref VPC
+  emrMasterIngressSelfICMP:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref masterSecurityGroup
+      IpProtocol: icmp
+      FromPort: -1
+      ToPort: -1
+      SourceSecurityGroupId: !Ref masterSecurityGroup
+  emrMasterIngressSlaveICMP:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref masterSecurityGroup
+      IpProtocol: icmp
+      FromPort: -1
+      ToPort: -1
+      SourceSecurityGroupId: !Ref slaveSecurityGroup
+  emrMasterIngressSelfAllTcp:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref masterSecurityGroup
+      IpProtocol: tcp
+      FromPort: 0
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref masterSecurityGroup
+  emrMasterIngressSlaveAllTcp:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref masterSecurityGroup
+      IpProtocol: tcp
+      FromPort: 0
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref slaveSecurityGroup
+  emrMasterIngressSelfAllUdp:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref masterSecurityGroup
+      IpProtocol: udp
+      FromPort: 0
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref masterSecurityGroup
+  emrMasterIngressSlaveAllUdp:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref masterSecurityGroup
+      IpProtocol: udp
+      FromPort: 0
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref slaveSecurityGroup
+  emrMasterIngressLivySG:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref masterSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8998
+      ToPort: 8998
+      SourceSecurityGroupId: !Ref SageMakerInstanceSecurityGroup
+  emrMasterIngressServiceSg:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref masterSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      SourceSecurityGroupId: !Ref emrServiceSecurityGroup
+  emrServiceIngressMasterSg:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref emrServiceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 9443
+      ToPort: 9443
+      SourceSecurityGroupId: !Ref masterSecurityGroup
+  emrServiceEgressMaster:
+    Type: 'AWS::EC2::SecurityGroupEgress'
+    Properties:
+      GroupId: !Ref emrServiceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      DestinationSecurityGroupId: !Ref masterSecurityGroup
+  emrServiceEgressSlave:
+    Type: 'AWS::EC2::SecurityGroupEgress'
+    Properties:
+      GroupId: !Ref emrServiceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      DestinationSecurityGroupId: !Ref slaveSecurityGroup
+  emrSlaveIngressSelfICMP:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref slaveSecurityGroup
+      IpProtocol: icmp
+      FromPort: -1
+      ToPort: -1
+      SourceSecurityGroupId: !Ref slaveSecurityGroup
+  emrSlaveIngressMasterICMP:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref slaveSecurityGroup
+      IpProtocol: icmp
+      FromPort: -1
+      ToPort: -1
+      SourceSecurityGroupId: !Ref masterSecurityGroup
+  emrSlaveIngressSelfAllTcp:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref slaveSecurityGroup
+      IpProtocol: tcp
+      FromPort: 0
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref slaveSecurityGroup
+  emrSlaveIngressMasterAllTcp:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref slaveSecurityGroup
+      IpProtocol: tcp
+      FromPort: 0
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref masterSecurityGroup
+  emrSlaveIngressSelfAllUdp:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref slaveSecurityGroup
+      IpProtocol: udp
+      FromPort: 0
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref slaveSecurityGroup
+  emrSlaveIngressMasterAllUdp:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref slaveSecurityGroup
+      IpProtocol: udp
+      FromPort: 0
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref masterSecurityGroup
+  emrSlaveIngressServiceSg:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref slaveSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      SourceSecurityGroupId: !Ref emrServiceSecurityGroup
+  EMRCluster:
+    DependsOn: CopyZips
+    Type: 'AWS::EMR::Cluster'
+    Properties:
+      Applications:
+        - Name: Spark
+        - Name: Hive
+        - Name: Livy
+      BootstrapActions:
+        - Name: Dummy bootstrap action
+          ScriptBootstrapAction:
+            Args:
+              - !Ref S3Bucket
+              - !FindInMap
+                - Studio
+                - s3params
+                - S3Key
+              - !FindInMap
+                - ClusterConfigurations
+                - emr
+                - MLeapJar
+            Path: !Sub 's3://${S3Bucket}/artifacts/emr-sagemaker-studio/createlinuxusers.sh'
+      AutoScalingRole: EMR_AutoScaling_DefaultRole
+      Configurations:
+        - Classification: livy-conf
+          ConfigurationProperties:
+            livy.server.session.timeout: 24h
+#        - Classification: spark-defaults
+#          ConfigurationProperties:
+#            spark.jars.packages: "ml.combust.mleap:mleap-spark_2.11:0.15.0,ml.combust.mleap:mleap-core_2.11:0.15.0,ml.combust.mleap:mleap-runtime_2.11:0.15.0"
+      EbsRootVolumeSize: 100
+      Instances:
+        CoreInstanceGroup:
+          EbsConfiguration:
+            EbsBlockDeviceConfigs:
+              - VolumeSpecification:
+                  SizeInGB: '320'
+                  VolumeType: gp2
+                VolumesPerInstance: '1'
+            EbsOptimized: 'true'
+          InstanceCount: !FindInMap 
+            - ClusterConfigurations
+            - emr
+            - coreInstanceCount
+          InstanceType: !FindInMap 
+            - ClusterConfigurations
+            - emr
+            - coreInstanceType
+          Market: SPOT
+          Name: coreNode
+        MasterInstanceGroup:
+          EbsConfiguration:
+            EbsBlockDeviceConfigs:
+              - VolumeSpecification:
+                  SizeInGB: '320'
+                  VolumeType: gp2
+                VolumesPerInstance: '1'
+            EbsOptimized: 'true'
+          InstanceCount: 1
+          InstanceType: !FindInMap 
+            - ClusterConfigurations
+            - emr
+            - masterInstanceType
+          Market: ON_DEMAND
+          Name: masterNode
+        Ec2SubnetId: !Ref PrivateSubnet1
+        EmrManagedMasterSecurityGroup: !Ref masterSecurityGroup
+        EmrManagedSlaveSecurityGroup: !Ref slaveSecurityGroup
+        ServiceAccessSecurityGroup: !Ref emrServiceSecurityGroup
+        TerminationProtected: false
+      ManagedScalingPolicy:
+        ComputeLimits:
+          MaximumCapacityUnits: 6
+          MaximumCoreCapacityUnits: 6
+          MaximumOnDemandCapacityUnits: 6
+          MinimumCapacityUnits: 2
+          UnitType: Instances
+      JobFlowRole: !Ref EMRClusterinstanceProfile
+      LogUri: s3://emr-logs-us-east-1-552816280786/logs/emr-sagemaker-studio/
+      Name: !Sub 'EMR-Cluster-${AWS::StackName}'
+      ReleaseLabel: !FindInMap 
+        - ClusterConfigurations
+        - emr
+        - emrReleaseVersion
+      ServiceRole: !Ref EMRClusterServiceRole
+      VisibleToAllUsers: true
+      KerberosAttributes:
+        CrossRealmTrustPrincipalPassword: CfnIntegrationTest-1
+        KdcAdminPassword: CfnIntegrationTest-1
+        Realm: EC2.INTERNAL
+      SecurityConfiguration: !Ref securityConfiguration
+      Steps:
+        - ActionOnFailure: CONTINUE
+          HadoopJarStep:
+            Args:
+              - !Sub 's3://${S3Bucket}/artifacts/emr-sagemaker-studio/configurekdc.sh'
+            Jar: !Sub 's3://${AWS::Region}.elasticmapreduce/libs/script-runner/script-runner.jar'
+            MainClass: ''
+          Name: run any bash or java job in spark
+  EMRClusterServiceRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - elasticmapreduce.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonElasticMapReduceRole'
+      Path: /
+    Type: 'AWS::IAM::Role'
+  EMRClusterinstanceProfile:
+    Properties:
+      Path: /
+      Roles:
+        - !Ref EMRClusterinstanceProfileRole
+    Type: 'AWS::IAM::InstanceProfile'
+  EMRClusterinstanceProfileRole:
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-EMRClusterinstanceProfileRole'
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonElasticMapReduceforEC2Role'
+      Path: /
+    Type: 'AWS::IAM::Role'
+  CleanUpBucketonDelete:
+    DependsOn: CleanUpBucketonDeleteLambda
+    Type: 'Custom::emptybucket'
+    Properties:
+      ServiceToken: !GetAtt 
+        - CleanUpBucketonDeleteLambda
+        - Arn
+      inputBucketName: !Ref S3Bucket
+  CleanUpBucketonDeleteLambda:
+    DependsOn:
+      - S3Bucket
+      - CleanUpBucketonDeleteLambdaRole
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Description: Empty bucket on delete
+      Handler: index.lambda_handler
+      Role: !GetAtt 
+        - CleanUpBucketonDeleteLambdaRole
+        - Arn
+      Runtime: python3.7
+      Timeout: 60
+      Code:
+        ZipFile: !Join 
+          - |+
+
+          - - import json
+            - import boto3
+            - import urllib3
+            - ''
+            - 'def empty_bucket(bucket_name):'
+            - '    print("Attempting to empty the bucket {0}".format(bucket_name))'
+            - '    s3_client = boto3.client(''s3'')'
+            - '    s3 = boto3.resource(''s3'')'
+            - ''
+            - '    try:'
+            - '        bucket = s3.Bucket(bucket_name).load()'
+            - '    except ClientError:'
+            - '        print("Bucket {0} does not exist".format(bucket_name))'
+            - '        return'
+            - '    # Confirm if versioning is enabled'
+            - '    version_status = s3_client.get_bucket_versioning(Bucket=bucket_name)'
+            - '    status = version_status.get(''Status'','''')'
+            - '    if status == ''Enabled'':'
+            - '        version_status = s3_client.put_bucket_versioning(Bucket=bucket_name,'
+            - '                                                   VersioningConfiguration={''Status'': ''Suspended''})'
+            - '    version_paginator = s3_client.get_paginator(''list_object_versions'')'
+            - '    version_iterator = version_paginator.paginate('
+            - '        Bucket=bucket_name'
+            - '    )'
+            - ''
+            - '    for page in version_iterator:'
+            - '        print(page)'
+            - '        if ''DeleteMarkers'' in page:'
+            - '            delete_markers = page[''DeleteMarkers'']'
+            - '            if delete_markers is not None:'
+            - '                for delete_marker in delete_markers:'
+            - '                    key = delete_marker[''Key'']'
+            - '                    versionId = delete_marker[''VersionId'']'
+            - '                    s3_client.delete_object(Bucket=bucket_name, Key=key, VersionId=versionId)'
+            - '        if ''Versions'' in page and page[''Versions''] is not None:'
+            - '            versions = page[''Versions'']'
+            - '            for version in versions:'
+            - '                print(version)'
+            - '                key = version[''Key'']'
+            - '                versionId = version[''VersionId'']'
+            - '                s3_client.delete_object(Bucket=bucket_name, Key=key, VersionId=versionId)'
+            - '    object_paginator = s3_client.get_paginator(''list_objects_v2'')'
+            - '    object_iterator = object_paginator.paginate('
+            - '        Bucket=bucket_name'
+            - '    )'
+            - '    for page in object_iterator:'
+            - '        if ''Contents'' in page:'
+            - '            for content in page[''Contents'']:'
+            - '                key = content[''Key'']'
+            - '                s3_client.delete_object(Bucket=bucket_name, Key=content[''Key''])'
+            - '    print("Successfully emptied the bucket {0}".format(bucket_name))'
+            - ''
+            - ''
+            - ''
+            - 'def lambda_handler(event, context):'
+            - '    try:'
+            - '        bucket = event[''ResourceProperties''][''inputBucketName'']'
+            - '        if event[''RequestType''] == ''Delete'':'
+            - '            empty_bucket(bucket)'
+            - '        sendResponse(event, context, "SUCCESS")'
+            - '    except Exception as e:'
+            - '        print(e)'
+            - '        sendResponse(event, context, "FAILED")'
+            - ''
+            - 'def sendResponse(event, context, status):'
+            - '    http = urllib3.PoolManager()'
+            - '    response_body = {''Status'': status,'
+            - '                     ''Reason'': ''Log stream name: '' + context.log_stream_name,'
+            - '                     ''PhysicalResourceId'': context.log_stream_name,'
+            - '                     ''StackId'': event[''StackId''],'
+            - '                     ''RequestId'': event[''RequestId''],'
+            - '                     ''LogicalResourceId'': event[''LogicalResourceId''],'
+            - '                     ''Data'': json.loads("{}")}'
+            - '    http.request(''PUT'', event[''ResponseURL''], body=json.dumps(response_body))'
+  CleanUpBucketonDeleteLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: !Sub 'CleanUpBucketonDeleteLambdaPolicy-${AWS::StackName}'
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:*'
+                Resource:
+                  - !GetAtt 
+                    - S3Bucket
+                    - Arn
+                  - !Join 
+                    - ''
+                    - - !GetAtt 
+                        - S3Bucket
+                        - Arn
+                      - /
+                  - !Join 
+                    - ''
+                    - - !GetAtt 
+                        - S3Bucket
+                        - Arn
+                      - /*
+              - Effect: Deny
+                Action:
+                  - 's3:DeleteBucket'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:*'
+                Resource: '*'
+  securityConfiguration:
+    Type: 'AWS::EMR::SecurityConfiguration'
+    Properties:
+      SecurityConfiguration:
+        AuthenticationConfiguration:
+          KerberosConfiguration:
+            Provider: ClusterDedicatedKdc
+            ClusterDedicatedKdcConfiguration:
+              TicketLifetimeInHours: 24
+        AuthorizationConfiguration:
+          EmrFsConfiguration:
+            RoleMappings:
+              - Role: !Sub >-
+                  arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-allowEMRFSAccessForUser1
+                IdentifierType: User
+                Identifiers:
+                  - user1
+
+  SageMakerInstanceSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: SMSG
+      GroupDescription: Security group with no ingress rule
+      VpcId: !Ref VPC
+  
+  SageMakerInstanceSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: '-1'
+      GroupId: !Ref SageMakerInstanceSecurityGroup
+      SourceSecurityGroupId: !Ref SageMakerInstanceSecurityGroup
+
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow TLS for VPC Endpoint
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-endpoint-security-group
+
+  EndpointSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: '-1'
+      GroupId: !Ref VPCEndpointSecurityGroup
+      SourceSecurityGroupId: !Ref SageMakerInstanceSecurityGroup
+
+  SageMakerExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - sagemaker.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: s3-access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource: arn:aws:s3:::*
+        - PolicyName: !Sub '${AWS::StackName}-sageemr'
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticmapreduce:ListInstances
+                  - elasticmapreduce:DescribeCluster
+                  - elasticmapreduce:DescribeSecurityConfiguration
+                  - iam:CreateServiceLinkedRole
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                Resource: '*'
+              - Sid: AllowPassRoleSageMaker
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: sagemaker.amazonaws.com
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonSageMakerFullAccess'
+        - 'arn:aws:iam::aws:policy/AmazonS3FullAccess'
+        - 'arn:aws:iam::aws:policy/AWSCloudFormationFullAccess'
+        - 'arn:aws:iam::aws:policy/AWSCodePipeline_FullAccess'
+  emrMasterIngressKDCSG:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref masterSecurityGroup
+      IpProtocol: tcp
+      FromPort: 88
+      ToPort: 88
+      SourceSecurityGroupId: !Ref SageMakerInstanceSecurityGroup
+  emrMasterIngressKDCAdminSG:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref masterSecurityGroup
+      IpProtocol: tcp
+      FromPort: 749
+      ToPort: 749
+      SourceSecurityGroupId: !Ref SageMakerInstanceSecurityGroup
+  emrMasterIngressKinit464SG:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref masterSecurityGroup
+      IpProtocol: tcp
+      FromPort: 464
+      ToPort: 464
+      SourceSecurityGroupId: !Ref SageMakerInstanceSecurityGroup
+  allowEMRFSAccessForUser1:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-allowEMRFSAccessForUser1'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-EMRClusterinstanceProfileRole'
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: !Sub '${AWS::StackName}-emrFS-user1'
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3Bucket}'
+                Effect: Allow
+              - Action:
+                  - 's3:*'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3Bucket}/*'
+                Effect: Allow
+
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess'
+        - 'arn:aws:iam::aws:policy/AmazonS3FullAccess'
+        - 'arn:aws:iam::aws:policy/IAMFullAccess'
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  LambdaExecutionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Path: /
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: CloudWatchLogsPermissions
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub "arn:${AWS::Partition}:logs:*:*:*"
+          - Sid: SageMakerDomainPermission
+            Effect: Allow
+            Action:
+              - sagemaker:ListDomains
+              - sagemaker:CreateDomain
+              - sagemaker:DescribeDomain
+              - sagemaker:DeleteDomain
+              - sagemaker:UpdateDomain
+              - sagemaker:ListUserProfiles
+              - sagemaker:CreateUserProfile
+              - sagemaker:UpdateUserProfile
+              - sagemaker:DeleteUserProfile
+              - sagemaker:DescribeUserProfile
+              - sageMaker:ListApps
+              - sagemaker:CreateApp
+              - sagemaker:DescribeApp
+              - sagemaker:UpdateApp
+              - sageMaker:DeleteApp
+            Resource:
+              - !Sub "arn:${AWS::Partition}:sagemaker:*:*:domain/*"
+              - !Sub "arn:${AWS::Partition}:sagemaker:*:*:user-profile/*"
+              - !Sub "arn:${AWS::Partition}:sagemaker:*:*:app/*"
+          - Sid: IAMServiceLinkedRolePermission
+            Effect: Allow
+            Action:
+              - iam:CreateServiceLinkedRole
+            Resource:
+              - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/sagemaker.amazonaws.com/AWSServiceRoleForAmazonSageMaker*"
+            Condition:
+                StringLike:
+                  iam:AWSServiceName: sagemaker.amazonaws.com
+          - Sid: IAMServiceLinkedRolePolicyPermission
+            Effect: Allow
+            Action:
+              - iam:AttachRolePolicy
+              - iam:PutRolePolicy
+            Resource:
+              - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/sagemaker.amazonaws.com/AWSServiceRoleForAmazonSageMaker*"
+          - Sid: SageMakerExecPassRole
+            Effect: Allow
+            Action:
+              - iam:PassRole
+            Resource: !GetAtt  SageMakerExecutionRole.Arn
+          - Sid: SageMakerProjectsPermission
+            Effect: Allow
+            Action:
+              - servicecatalog:AcceptPortfolioShare
+              - sagemaker:EnableSagemakerServicecatalogPortfolio
+              - sagemaker:DisableSagemakerServicecatalogPortfolio
+            Resource: '*'
+          - Sid: ServiceCatalogPermission
+            Effect: Allow
+            Action:
+              - servicecatalog:*
+            Resource: '*'
+      Roles:
+        - !Ref  LambdaExecutionRole
+
+  CopyZips:
+    Type: Custom::CopyZips
+    Properties:
+      ServiceToken: !GetAtt 'CopyZipsFunction.Arn'
+      DestBucket: !Ref 'S3Bucket'
+      SourceBucket: !FindInMap 
+          - Studio
+          - s3params
+          - S3Bucket
+      Prefix: !FindInMap 
+          - Studio
+          - s3params
+          - S3Key
+      Objects: 
+#        - !FindInMap
+#          - ClusterConfigurations
+#          - emr
+#          - MLeapJar
+        - !FindInMap
+          - ClusterConfigurations
+          - emr
+          - BootStrapScriptFile
+        - !FindInMap 
+          - ClusterConfigurations
+          - emr
+          - StepScriptFile
+  CopyZipsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Path: /
+      Policies:
+        - PolicyName: lambda-copier
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3Bucket}/*'
+
+  CopyZipsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Copies objects from a source S3 bucket to a destination
+      Handler: index.handler
+      Runtime: python3.8
+      Role: !GetAtt 'CopyZipsRole.Arn'
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import threading
+          import boto3
+          import cfnresponse
+          def copy_objects(source_bucket, dest_bucket, prefix, objects):
+              s3 = boto3.resource('s3')
+              for o in objects:
+                  key = prefix + o
+                  copy_source = {
+                      'Bucket': source_bucket,
+                      'Key': key
+                  }
+                  print(f'copy_source: {copy_source}')
+                  print(f'dest_bucket = {dest_bucket}')
+                  print(f'source key = {key}')
+                  s3.Object(dest_bucket, f'artifacts/emr-sagemaker-studio/{o}').copy_from(CopySource=f'{source_bucket}/{key}')
+          def delete_objects(bucket, prefix, objects):
+              s3 = boto3.client('s3')
+              objects = {'Objects': [{'Key': prefix + o} for o in objects]}
+              s3.delete_objects(Bucket=bucket, Delete=objects)
+          def timeout(event, context):
+              logging.error('Execution is about to time out, sending failure response to CloudFormation')
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, None)
+          def handler(event, context):
+              # make sure we send a failure to CloudFormation if the function
+              # is going to timeout
+              timer = threading.Timer((context.get_remaining_time_in_millis()
+                        / 1000.00) - 0.5, timeout, args=[event, context])
+              timer.start()
+              print('Received event: %s' % json.dumps(event))
+              status = cfnresponse.SUCCESS
+              try:
+                  source_bucket = event['ResourceProperties']['SourceBucket']
+                  dest_bucket = event['ResourceProperties']['DestBucket']
+                  prefix = event['ResourceProperties']['Prefix']
+                  objects = event['ResourceProperties']['Objects']
+                  if event['RequestType'] == 'Delete':
+                      delete_objects(dest_bucket, prefix, objects)
+                  else:
+                      copy_objects(source_bucket, dest_bucket, prefix, objects)
+              except Exception as e:
+                  logging.error('Exception: %s' % e, exc_info=True)
+                  status = cfnresponse.FAILED
+              finally:
+                  timer.cancel()
+                  cfnresponse.send(event, context, status, {}, None)
+
+
+  VPCEndpointSagemakerAPI:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: '*'
+            Resource: '*'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sagemaker.api'
+      VpcId: !Ref VPC
+
+  VPCEndpointSageMakerRuntime:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: '*'
+            Resource: '*'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sagemaker.runtime'
+      VpcId: !Ref VPC
+ 
+  VPCEndpointSTS:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: '*'
+            Resource: '*'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sts'
+      VpcId: !Ref VPC
+
+  VPCEndpointCW:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: '*'
+            Resource: '*'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.monitoring'
+      VpcId: !Ref VPC
+
+  VPCEndpointCWL:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: '*'
+            Resource: '*'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.logs'
+      VpcId: !Ref VPC
+
+  VPCEndpointECR:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: '*'
+            Resource: '*'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.dkr'
+      VpcId: !Ref VPC
+
+  VPCEndpointECRAPI:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: '*'
+            Resource: '*'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.api'
+      VpcId: !Ref VPC
+
+  VPCEndpointSC:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.servicecatalog'
+      VpcId: !Ref VPC
+
+  # Adding a wait time after SageMakerExecutionRole creation
+  # this is due to a possible delay in role propagation (https://t.corp.amazon.com/P45031666)
+  DomainDeploymentDelay:
+    Type: 'Custom::Delay'
+    DependsOn: SageMakerExecutionRole
+    Properties:
+      ServiceToken: !GetAtt DelayLambda.Arn
+      TimeToWait: 180
+  DelayLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: "index.handler"
+      Timeout: 660
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.7
+      Code:
+        ZipFile: |
+          import json
+          import cfnresponse
+          import time
+          def handler(event, context):
+            if event.get('RequestType', "unknown") != "Delete":
+              time_to_wait = int(event['ResourceProperties']['TimeToWait'])
+              print(f'Waiting for {time_to_wait} seconds')
+              time.sleep(time_to_wait)
+              print(f'Waiting finished')
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, {},'')
+
+
+  StudioDomain:
+    DependsOn: DomainDeploymentDelay
+    Type: AWS::SageMaker::Domain
+    Properties:
+      VpcId: !Ref VPC
+      SubnetIds:
+        - !Ref PrivateSubnet1
+      DomainName: !Ref DomainName 
+      AppNetworkAccessType: VpcOnly
+      AuthMode: IAM
+      DefaultUserSettings:
+        ExecutionRole: !GetAtt SageMakerExecutionRole.Arn
+        SecurityGroups:
+           - !Ref SageMakerInstanceSecurityGroup
+  EnableProjectsLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: StudioDomain
+    Properties:
+      FunctionName: CFEnableSagemakerProjects
+      Code:
+        ZipFile: |
+          # Function: CFEnableSagemakerProjects
+          # Purpose:  Enables Sagemaker Projects
+          import json
+          import boto3
+          import cfnresponse
+
+          client = boto3.client('sagemaker')
+          sc_client = boto3.client('servicecatalog')
+
+          def lambda_handler(event, context):
+              response_status = cfnresponse.SUCCESS
+              execution_role = event['ResourceProperties']['ExecutionRole']
+
+              if 'RequestType' in event and event['RequestType'] == 'Create':
+                  enable_projects(execution_role)
+              cfnresponse.send(event, context, response_status, {}, '')
+
+
+          def enable_projects(studio_role_arn):
+              # enable Project on account level (accepts portfolio share)
+              response = client.enable_sagemaker_servicecatalog_portfolio()
+
+              # associate studio role with portfolio
+              response = sc_client.list_accepted_portfolio_shares()
+
+              portfolio_id = ''
+              for portfolio in response['PortfolioDetails']:
+                  if portfolio['ProviderName'] == 'Amazon SageMaker':
+                      portfolio_id = portfolio['Id']
+
+              response = sc_client.associate_principal_with_portfolio(
+                  PortfolioId=portfolio_id,
+                  PrincipalARN=studio_role_arn,
+                  PrincipalType='IAM'
+              )
+      Description: Enable Sagemaker Projects
+      Handler: index.lambda_handler
+      MemorySize: 512
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.7
+      Timeout: 5
+  EnableProjects:
+    Type: Custom::ResourceForEnablingSageMakerProjects
+    Properties:
+      ServiceToken: !GetAtt EnableProjectsLambda.Arn
+      ExecutionRole: !GetAtt SageMakerExecutionRole.Arn
+
+  UserProfile:
+    Type: AWS::SageMaker::UserProfile
+    Properties:
+      DomainId: !GetAtt StudioDomain.DomainId
+      UserProfileName: !Ref UserProfileName
+      UserSettings:
+        ExecutionRole: !GetAtt SageMakerExecutionRole.Arn
+
+  JupyterApp:
+    Type: AWS::SageMaker::App
+    DependsOn: UserProfile
+    Properties:
+      AppName: default
+      AppType: JupyterServer
+      DomainId: !GetAtt StudioDomain.DomainId
+      UserProfileName: !Ref UserProfileName
+  DataScienceApp:
+    Type: AWS::SageMaker::App
+    DependsOn: UserProfile
+    Properties:
+      AppName: datascience-kernel-ml-t3-medium
+      AppType: KernelGateway
+      DomainId: !GetAtt StudioDomain.DomainId
+      ResourceSpec:
+        InstanceType:  ml.t3.medium
+        SageMakerImageArn: !FindInMap
+          - RegionMap
+          - !Ref 'AWS::Region'
+          - datascience
+      UserProfileName: !Ref UserProfileName
+  TensorFlow23CpuApp:
+    Type: AWS::SageMaker::App
+    DependsOn: UserProfile
+    Properties:
+      AppName: tensorflow23cpu-kernel-ml-t3-medium
+      AppType: KernelGateway
+      DomainId: !GetAtt StudioDomain.DomainId
+      ResourceSpec:
+        InstanceType:  ml.t3.medium
+        SageMakerImageArn: !FindInMap
+          - RegionMap
+          - !Ref 'AWS::Region'
+          - tensorflow23cpu
+      UserProfileName: !Ref UserProfileName
+  PySparkMagicApp:
+    Type: AWS::SageMaker::App
+    DependsOn: UserProfile
+    Properties:
+      AppName: pyspark-magic-kernel-ml-t3-medium
+      AppType: KernelGateway
+      DomainId: !GetAtt StudioDomain.DomainId
+      ResourceSpec:
+        InstanceType:  ml.t3.medium
+        SageMakerImageArn: !FindInMap
+          - RegionMap
+          - !Ref 'AWS::Region'
+          - pysparkmagic
+      UserProfileName: !Ref UserProfileName
+
+  AmazonSageMakerServiceCatalogProductsLaunchRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-SageMakerSCProductsLaunchRole'
+      Description: "SageMaker role created from the SageMaker AWS Management Console. This role has the permissions required to launch the Amazon SageMaker portfolio of products from AWS ServiceCatalog."
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "servicecatalog.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Path: "/service-role/"
+      MaxSessionDuration: 3600
+      Policies:
+        - PolicyName: AmazonSageMakerAdmin-ServiceCatalogProductsServiceRolePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'apigateway:GET'
+                  - 'apigateway:POST'
+                  - 'apigateway:PUT'
+                  - 'apigateway:PATCH'
+                  - 'apigateway:DELETE'
+                Resource: '*'
+                Condition:
+                  StringLike:
+                    'aws:ResourceTag/sagemaker:launch-source': '*'
+              - Effect: Allow
+                Action:
+                  - 'apigateway:POST'
+                Resource: '*'
+                Condition:
+                  'ForAnyValue:StringLike':
+                    'aws:TagKeys':
+                      - 'sagemaker:launch-source'
+              - Effect: Allow
+                Action:
+                  - 'apigateway:PATCH'
+                Resource:
+                  - 'arn:aws:apigateway:*::/account'
+              - Effect: Allow
+                Action:
+                  - 'cloudformation:CreateStack'
+                  - 'cloudformation:UpdateStack'
+                  - 'cloudformation:DeleteStack'
+                Resource: 'arn:aws:cloudformation:*:*:stack/SC-*'
+                Condition:
+                  ArnLikeIfExists:
+                    'cloudformation:RoleArn':
+                      - 'arn:aws:sts::*:assumed-role/AmazonSageMakerServiceCatalog*'
+              - Effect: Allow
+                Action:
+                  - 'cloudformation:DescribeStackEvents'
+                  - 'cloudformation:DescribeStacks'
+                Resource: 'arn:aws:cloudformation:*:*:stack/SC-*'
+              - Effect: Allow
+                Action:
+                  - 'cloudformation:GetTemplateSummary'
+                  - 'cloudformation:ValidateTemplate'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'codebuild:CreateProject'
+                  - 'codebuild:DeleteProject'
+                  - 'codebuild:UpdateProject'
+                Resource:
+                  - 'arn:aws:codebuild:*:*:project/sagemaker-*'
+              - Effect: Allow
+                Action:
+                  - 'codecommit:CreateCommit'
+                  - 'codecommit:CreateRepository'
+                  - 'codecommit:DeleteRepository'
+                  - 'codecommit:GetRepository'
+                  - 'codecommit:TagResource'
+                Resource:
+                  - 'arn:aws:codecommit:*:*:sagemaker-*'
+              - Effect: Allow
+                Action:
+                  - 'codecommit:ListRepositories'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'codepipeline:CreatePipeline'
+                  - 'codepipeline:DeletePipeline'
+                  - 'codepipeline:GetPipeline'
+                  - 'codepipeline:GetPipelineState'
+                  - 'codepipeline:StartPipelineExecution'
+                  - 'codepipeline:TagResource'
+                  - 'codepipeline:UpdatePipeline'
+                Resource:
+                  - 'arn:aws:codepipeline:*:*:sagemaker-*'
+              - Effect: Allow
+                Action:
+                  - 'cognito-idp:CreateUserPool'
+                Resource: '*'
+                Condition:
+                  'ForAnyValue:StringLike':
+                    'aws:TagKeys':
+                      - 'sagemaker:launch-source'
+              - Effect: Allow
+                Action:
+                  - 'cognito-idp:CreateGroup'
+                  - 'cognito-idp:CreateUserPoolDomain'
+                  - 'cognito-idp:CreateUserPoolClient'
+                  - 'cognito-idp:DeleteGroup'
+                  - 'cognito-idp:DeleteUserPool'
+                  - 'cognito-idp:DeleteUserPoolClient'
+                  - 'cognito-idp:DeleteUserPoolDomain'
+                  - 'cognito-idp:DescribeUserPool'
+                  - 'cognito-idp:DescribeUserPoolClient'
+                  - 'cognito-idp:UpdateUserPool'
+                  - 'cognito-idp:UpdateUserPoolClient'
+                Resource: '*'
+                Condition:
+                  StringLike:
+                    'aws:ResourceTag/sagemaker:launch-source': '*'
+              - Action:
+                  - 'ecr:CreateRepository'
+                  - 'ecr:DeleteRepository'
+                Resource:
+                  - 'arn:aws:ecr:*:*:repository/sagemaker-*'
+                Effect: Allow
+              - Effect: Allow
+                Action:
+                  - 'events:DescribeRule'
+                  - 'events:DeleteRule'
+                  - 'events:DisableRule'
+                  - 'events:EnableRule'
+                  - 'events:PutRule'
+                  - 'events:PutTargets'
+                  - 'events:RemoveTargets'
+                Resource:
+                  - 'arn:aws:events:*:*:rule/sagemaker-*'
+              - Effect: Allow
+                Action:
+                  - 'firehose:CreateDeliveryStream'
+                  - 'firehose:DeleteDeliveryStream'
+                  - 'firehose:DescribeDeliveryStream'
+                  - 'firehose:StartDeliveryStreamEncryption'
+                  - 'firehose:StopDeliveryStreamEncryption'
+                  - 'firehose:UpdateDestination'
+                Resource: 'arn:aws:firehose:*:*:deliverystream/sagemaker-*'
+              - Action:
+                  - 'glue:CreateDatabase'
+                  - 'glue:DeleteDatabase'
+                Resource:
+                  - 'arn:aws:glue:*:*:catalog'
+                  - 'arn:aws:glue:*:*:database/sagemaker-*'
+                  - 'arn:aws:glue:*:*:table/sagemaker-*'
+                  - 'arn:aws:glue:*:*:userDefinedFunction/sagemaker-*'
+                Effect: Allow
+              - Action:
+                  - 'glue:CreateClassifier'
+                  - 'glue:DeleteClassifier'
+                  - 'glue:DeleteCrawler'
+                  - 'glue:DeleteJob'
+                  - 'glue:DeleteTrigger'
+                  - 'glue:DeleteWorkflow'
+                  - 'glue:StopCrawler'
+                Resource:
+                  - '*'
+                Effect: Allow
+              - Action:
+                  - 'glue:CreateWorkflow'
+                Resource:
+                  - 'arn:aws:glue:*:*:workflow/sagemaker-*'
+                Effect: Allow
+              - Action:
+                  - 'glue:CreateJob'
+                Resource:
+                  - 'arn:aws:glue:*:*:job/sagemaker-*'
+                Effect: Allow
+              - Action:
+                  - 'glue:CreateCrawler'
+                  - 'glue:GetCrawler'
+                Resource:
+                  - 'arn:aws:glue:*:*:crawler/sagemaker-*'
+                Effect: Allow
+              - Action:
+                  - 'glue:CreateTrigger'
+                  - 'glue:GetTrigger'
+                Resource:
+                  - 'arn:aws:glue:*:*:trigger/sagemaker-*'
+                Effect: Allow
+              - Effect: Allow
+                Action:
+                  - 'iam:PassRole'
+                Resource:
+                  - 'arn:aws:iam::*:role/service-role/AmazonSageMakerServiceCatalog*'
+              - Effect: Allow
+                Action:
+                  - 'lambda:AddPermission'
+                  - 'lambda:CreateFunction'
+                  - 'lambda:DeleteFunction'
+                  - 'lambda:GetFunction'
+                  - 'lambda:GetFunctionConfiguration'
+                  - 'lambda:InvokeFunction'
+                  - 'lambda:RemovePermission'
+                Resource:
+                  - 'arn:aws:lambda:*:*:function:sagemaker-*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:DeleteLogGroup'
+                  - 'logs:DeleteLogStream'
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
+                  - 'logs:PutRetentionPolicy'
+                Resource:
+                  - 'arn:aws:logs:*:*:log-group:/aws/apigateway/AccessLogs/*'
+                  - 'arn:aws:logs:*:*:log-group::log-stream:*'
+              - Effect: Allow
+                Action: 's3:GetObject'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    's3:ExistingObjectTag/servicecatalog:provisioning': 'true'
+              - Effect: Allow
+                Action: 's3:GetObject'
+                Resource:
+                  - 'arn:aws:s3:::sagemaker-*'
+              - Effect: Allow
+                Action:
+                  - 's3:CreateBucket'
+                  - 's3:DeleteBucket'
+                  - 's3:DeleteBucketPolicy'
+                  - 's3:GetBucketPolicy'
+                  - 's3:PutBucketAcl'
+                  - 's3:PutBucketNotification'
+                  - 's3:PutBucketPolicy'
+                  - 's3:PutBucketPublicAccessBlock'
+                  - 's3:PutBucketLogging'
+                  - 's3:PutEncryptionConfiguration'
+                Resource: 'arn:aws:s3:::sagemaker-*'
+              - Action:
+                  - 'sagemaker:CreateEndpoint'
+                  - 'sagemaker:CreateEndpointConfig'
+                  - 'sagemaker:CreateModel'
+                  - 'sagemaker:CreateWorkteam'
+                  - 'sagemaker:DeleteEndpoint'
+                  - 'sagemaker:DeleteEndpointConfig'
+                  - 'sagemaker:DeleteModel'
+                  - 'sagemaker:DeleteWorkteam'
+                  - 'sagemaker:DescribeModel'
+                  - 'sagemaker:DescribeEndpointConfig'
+                  - 'sagemaker:DescribeEndpoint'
+                  - 'sagemaker:DescribeWorkteam'
+                Resource:
+                  - 'arn:aws:sagemaker:*:*:*'
+                Effect: Allow
+              - Action:
+                  - 'states:CreateStateMachine'
+                  - 'states:DeleteStateMachine'
+                  - 'states:UpdateStateMachine'
+                Resource:
+                  - 'arn:aws:states:*:*:stateMachine:sagemaker-*'
+                Effect: Allow
+
+  AmazonSageMakerServiceCatalogProductsUseRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-SageMakerSCProductsUseRole'
+      Description: "SageMaker role created from the SageMaker AWS Management Console. This role has the permissions required to use the Amazon SageMaker portfolio of products from AWS ServiceCatalog."
+      Path: "/service-role/"
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "cloudformation.amazonaws.com"
+                - "apigateway.amazonaws.com"
+                - "lambda.amazonaws.com"
+                - "codebuild.amazonaws.com"
+                - "sagemaker.amazonaws.com"
+                - "glue.amazonaws.com"
+                - "events.amazonaws.com"
+                - "states.amazonaws.com"
+                - "codepipeline.amazonaws.com"
+                - "firehose.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: AmazonSageMakerServiceCatalogProductsUseRole-20210323T120000
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:CreateStack
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:SetStackPolicy
+                  - cloudformation:UpdateStack
+                Resource: arn:aws:cloudformation:*:*:stack/sagemaker-*
+                Effect: Allow
+              -
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+                Effect: Allow
+              -
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource:
+                  - arn:aws:codebuild:*:*:project/sagemaker-*
+                  - arn:aws:codebuild:*:*:build/sagemaker-*
+                Effect: Allow
+              -
+                Action:
+                  - codecommit:CancelUploadArchive
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:UploadArchive
+                Resource: arn:aws:codecommit:*:*:sagemaker-*
+                Effect: Allow
+              -
+                Action:
+                  - codepipeline:StartPipelineExecution
+                Resource: arn:aws:codepipeline:*:*:sagemaker-*
+                Effect: Allow
+              -
+                Action:
+                  - ec2:DescribeRouteTables
+                Resource: "*"
+                Effect: Allow
+              -
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:Describe*
+                  - ecr:GetAuthorizationToken
+                  - ecr:GetDownloadUrlForLayer
+                Resource: "*"
+                Effect: Allow
+              -
+                Effect: Allow
+                Action:
+                  - ecr:BatchDeleteImage
+                  - ecr:CompleteLayerUpload
+                  - ecr:CreateRepository
+                  - ecr:DeleteRepository
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource:
+                  - arn:aws:ecr:*:*:repository/sagemaker-*
+              -
+                Action:
+                  - events:DeleteRule
+                  - events:DescribeRule
+                  - events:PutRule
+                  - events:PutTargets
+                  - events:RemoveTargets
+                Resource:
+                  - arn:aws:events:*:*:rule/sagemaker-*
+                Effect: Allow
+              -
+                Action:
+                  - firehose:PutRecord
+                  - firehose:PutRecordBatch
+                Resource: arn:aws:firehose:*:*:deliverystream/sagemaker-*
+                Effect: Allow
+              -
+                Action:
+                  - glue:BatchCreatePartition
+                  - glue:BatchDeletePartition
+                  - glue:BatchDeleteTable
+                  - glue:BatchDeleteTableVersion
+                  - glue:BatchGetPartition
+                  - glue:CreateDatabase
+                  - glue:CreatePartition
+                  - glue:CreateTable
+                  - glue:DeletePartition
+                  - glue:DeleteTable
+                  - glue:DeleteTableVersion
+                  - glue:GetDatabase
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetTableVersion
+                  - glue:GetTableVersions
+                  - glue:SearchTables
+                  - glue:UpdatePartition
+                  - glue:UpdateTable
+                Resource:
+                  - arn:aws:glue:*:*:catalog
+                  - arn:aws:glue:*:*:database/default
+                  - arn:aws:glue:*:*:database/global_temp
+                  - arn:aws:glue:*:*:database/sagemaker-*
+                  - arn:aws:glue:*:*:table/sagemaker-*
+                  - arn:aws:glue:*:*:tableVersion/sagemaker-*
+                Effect: Allow
+              -
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - arn:aws:iam::*:role/service-role/AmazonSageMakerServiceCatalogProductsUse*
+                Effect: Allow
+              -
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - arn:aws:lambda:*:*:function:sagemaker-*
+              -
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DeleteLogDelivery
+                  - logs:Describe*
+                  - logs:GetLogDelivery
+                  - logs:GetLogEvents
+                  - logs:ListLogDeliveries
+                  - logs:PutLogEvents
+                  - logs:PutResourcePolicy
+                  - logs:UpdateLogDelivery
+                Resource: "*"
+                Effect: Allow
+              -
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:DeleteBucket
+                  - s3:GetBucketAcl
+                  - s3:GetBucketCors
+                  - s3:GetBucketLocation
+                  - s3:ListAllMyBuckets
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutBucketCors
+                Resource:
+                  - arn:aws:s3:::aws-glue-*
+                  - arn:aws:s3:::sagemaker-*
+              -
+                Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:DeleteObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource:
+                  - arn:aws:s3:::aws-glue-*
+                  - arn:aws:s3:::sagemaker-*
+              -
+                Effect: Allow
+                Action:
+                  - sagemaker:*
+                NotResource:
+                  - arn:aws:sagemaker:*:*:domain/*
+                  - arn:aws:sagemaker:*:*:user-profile/*
+                  - arn:aws:sagemaker:*:*:app/*
+                  - arn:aws:sagemaker:*:*:flow-definition/*
+              -
+                Action:
+                  - states:DescribeExecution
+                  - states:DescribeStateMachine
+                  - states:DescribeStateMachineForExecution
+                  - states:GetExecutionHistory
+                  - states:ListExecutions
+                  - states:ListTagsForResource
+                  - states:StartExecution
+                  - states:StopExecution
+                  - states:TagResource
+                  - states:UntagResource
+                  - states:UpdateStateMachine
+                Resource:
+                  - arn:aws:states:*:*:stateMachine:sagemaker-*
+                  - arn:aws:states:*:*:execution:sagemaker-*:*
+                Effect: Allow
+              -
+                Action:
+                  - states:ListStateMachines
+                Resource: "*"
+                Effect: Allow
+
+Outputs:
+  VPCandCIDR:
+    Description: VPC ID and CIDR block
+    Value: !Join 
+      - ' - '
+      - - !Ref VPC
+        - !GetAtt 
+          - VPC
+          - CidrBlock
+  PublicSubnets:
+    Description: All public subnet created
+    Value: !Join 
+      - ''
+      - - !Ref PublicSubnet1
+  PrivateSubnets:
+    Description: All private subnet created
+    Value: !Join 
+      - ', '
+      - - !Ref PrivateSubnet1
+  S3BucketName:
+    Description: Bucket Name for Amazon S3 bucket
+    Value: !Ref S3Bucket
+  EMRMasterDNSName:
+    Description: DNS Name of the EMR Master Node
+    Value: !GetAtt 
+      - EMRCluster
+      - MasterPublicDNS
+  EMRClusterId:
+    Description: Id of the EMR cluster to use for Livy connection
+    Value: !Ref EMRCluster
+  StudioDomainURL:
+    Description: URL for the Studio Domain
+    Value: !GetAtt
+      - StudioDomain
+      - Url
